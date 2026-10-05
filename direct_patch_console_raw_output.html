@@ -1,0 +1,296 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Direct Patch Console</title>
+<style>
+  :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+  body { max-width: 1200px; margin: 0 auto; padding: 20px; }
+  h1 { margin-bottom: 4px; }
+  .muted { opacity: .72; }
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:14px; }
+  textarea {
+    width:100%; min-height:320px; box-sizing:border-box;
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    font-size:13px;
+  }
+  #directions { min-height:320px; }
+  #output { min-height:520px; }
+  button, input { margin:4px 6px 4px 0; padding:8px 12px; }
+  .ok { color:#188038; }
+  .err { color:#d93025; white-space:pre-wrap; }
+  pre { overflow:auto; padding:10px; border:1px solid #8885; }
+  @media(max-width:800px){ .grid{grid-template-columns:1fr;} }
+</style>
+</head>
+<body>
+<h1>Direct Patch Console</h1>
+<p class="muted">
+Load or paste your original source, paste deterministic patch directions, then click
+<strong>Generate patched source</strong>. The output is the complete raw modified file.
+</p>
+
+<input id="file" type="file">
+<button id="generate">Generate patched source</button>
+<button id="download" disabled>Download patched file</button>
+<button id="copy" disabled>Copy patched source</button>
+<button id="reset">Reset output</button>
+
+<div id="status"></div>
+
+<div class="grid">
+  <section>
+    <h2>Original source</h2>
+    <textarea id="source" spellcheck="false" placeholder="Load a file or paste the original HTML/JS here."></textarea>
+  </section>
+
+  <section>
+    <h2>Patch directions</h2>
+    <textarea id="directions" spellcheck="false" placeholder='REPLACE
+<<<
+old code
+===
+new code
+>>>
+
+INSERT_AFTER
+<<<
+exact anchor
+===
+new code
+>>>'></textarea>
+  </section>
+</div>
+
+<h2>Patched source</h2>
+<p class="muted">This box contains the complete resulting file — no diff symbols and no added line numbers.</p>
+<textarea id="output" spellcheck="false" placeholder="The complete patched source will appear here."></textarea>
+
+<details>
+<summary>Patch instruction format</summary>
+<pre>REPLACE
+&lt;&lt;&lt;
+exact existing text
+===
+replacement text
+&gt;&gt;&gt;
+
+INSERT_AFTER
+&lt;&lt;&lt;
+exact unique anchor
+===
+text to insert
+&gt;&gt;&gt;
+
+INSERT_BEFORE
+&lt;&lt;&lt;
+exact unique anchor
+===
+text to insert
+&gt;&gt;&gt;
+
+REMOVE
+&lt;&lt;&lt;
+exact text to remove
+&gt;&gt;&gt;</pre>
+</details>
+
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  let filename = "patched.html";
+  let originalLoaded = "";
+
+  function setStatus(text, error = false) {
+    $("status").className = error ? "err" : "ok";
+    $("status").textContent = text;
+  }
+
+  function countOccurrences(haystack, needle) {
+    if (!needle) return 0;
+    let count = 0;
+    let pos = 0;
+    while ((pos = haystack.indexOf(needle, pos)) !== -1) {
+      count++;
+      pos += needle.length;
+    }
+    return count;
+  }
+
+  function parseDirections(text) {
+    const operations = [];
+    const re = /(REPLACE|INSERT_AFTER|INSERT_BEFORE|REMOVE)\s*\r?\n<<<\r?\n([\s\S]*?)(?:\r?\n===\r?\n([\s\S]*?))?\r?\n>>>/g;
+
+    let match;
+    while ((match = re.exec(text)) !== null) {
+      operations.push({
+        type: match[1],
+        target: match[2],
+        value: match[3] ?? ""
+      });
+    }
+
+    if (!operations.length) {
+      throw new Error("No valid patch operations found.");
+    }
+
+    return operations;
+  }
+
+  function executePatch(original, operations) {
+    // Work on a temporary string. The visible original source is never
+    // partially modified if a later operation fails.
+    let result = original;
+
+    for (let i = 0; i < operations.length; i++) {
+      const op = operations[i];
+      const matches = countOccurrences(result, op.target);
+
+      if (matches !== 1) {
+        throw new Error(
+          `Operation ${i + 1} (${op.type}) expected exactly 1 match, found ${matches}.` +
+          `\n\nTarget:\n${op.target}`
+        );
+      }
+
+      const at = result.indexOf(op.target);
+
+      switch (op.type) {
+        case "REPLACE":
+          result =
+            result.slice(0, at) +
+            op.value +
+            result.slice(at + op.target.length);
+          break;
+
+        case "REMOVE":
+          result =
+            result.slice(0, at) +
+            result.slice(at + op.target.length);
+          break;
+
+        case "INSERT_BEFORE":
+          result =
+            result.slice(0, at) +
+            op.value +
+            result.slice(at);
+          break;
+
+        case "INSERT_AFTER": {
+          const end = at + op.target.length;
+          result =
+            result.slice(0, end) +
+            op.value +
+            result.slice(end);
+          break;
+        }
+
+        default:
+          throw new Error(`Unknown operation: ${op.type}`);
+      }
+    }
+
+    return result;
+  }
+
+  function generate() {
+    try {
+      const original = $("source").value;
+      if (!original) throw new Error("Original source is empty.");
+
+      const operations = parseDirections($("directions").value);
+      const result = executePatch(original, operations);
+
+      // IMPORTANT: raw complete resulting source only.
+      $("output").value = result;
+
+      $("download").disabled = false;
+      $("copy").disabled = false;
+
+      setStatus(
+        `${operations.length} operation(s) applied successfully. ` +
+        `The Patched source box now contains the complete resulting file.`
+      );
+
+      return result;
+    } catch (error) {
+      // Do not replace a previously successful output with partial content.
+      setStatus(error.message, true);
+      throw error;
+    }
+  }
+
+  $("file").addEventListener("change", async event => {
+    const file = event.target.files[0];
+    if (!file) return;
+
+    filename = file.name;
+    originalLoaded = await file.text();
+
+    $("source").value = originalLoaded;
+    $("output").value = "";
+    $("download").disabled = true;
+    $("copy").disabled = true;
+
+    setStatus(
+      `Loaded ${file.name} (${originalLoaded.length.toLocaleString()} characters).`
+    );
+  });
+
+  $("generate").onclick = () => {
+    try {
+      generate();
+    } catch {}
+  };
+
+  $("copy").onclick = async () => {
+    try {
+      await navigator.clipboard.writeText($("output").value);
+      setStatus("Complete patched source copied.");
+    } catch {
+      $("output").focus();
+      $("output").select();
+      setStatus("Clipboard access failed. Patched source selected for manual copy.", true);
+    }
+  };
+
+  $("download").onclick = () => {
+    const result = $("output").value;
+    if (!result) return;
+
+    const blob = new Blob([result], {
+      type: filename.toLowerCase().endsWith(".html")
+        ? "text/html;charset=utf-8"
+        : "text/plain;charset=utf-8"
+    });
+
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+
+    const dot = filename.lastIndexOf(".");
+    a.download = dot > 0
+      ? filename.slice(0, dot) + "-patched" + filename.slice(dot)
+      : filename + "-patched";
+
+    a.href = url;
+    a.click();
+
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+
+  $("reset").onclick = () => {
+    $("output").value = "";
+    $("download").disabled = true;
+    $("copy").disabled = true;
+
+    if (originalLoaded) {
+      $("source").value = originalLoaded;
+    }
+
+    setStatus("Output cleared. Original source left unchanged.");
+  };
+})();
+</script>
+</body>
+</html>
